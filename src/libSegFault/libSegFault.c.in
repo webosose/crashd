@@ -699,11 +699,18 @@ custom_fprintf(void *stream, const char *format, ...)
 static void enable_core_dump(void)
 {
 	struct rlimit rlim;
-	getrlimit(RLIMIT_CORE,&rlim);
-	rlim.rlim_cur = rlim.rlim_max;
-	setrlimit(RLIMIT_CORE,&rlim);
-
-	prctl(PR_SET_DUMPABLE, 1, 0, 0);
+	if (getrlimit(RLIMIT_CORE,&rlim) == 0 ) {
+		rlim.rlim_cur = rlim.rlim_max;
+		if (setrlimit(RLIMIT_CORE,&rlim) != 0) {
+			custom_fprintf(stderr, "setrlimit() failed \
+			with error reason=%s\n", strerror(errno));
+		}
+		prctl(PR_SET_DUMPABLE, 1, 0, 0);
+	}
+	else {
+		custom_fprintf(stderr, "getrlimit() failed \
+		with error reason=%s\n", strerror(errno));
+	}
 }
 
 /**
