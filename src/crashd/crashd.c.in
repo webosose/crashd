@@ -1,0 +1,397 @@
+// Copyright (c) 2013-2018 LG Electronics, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#define _GNU_SOURCE 1 // for using program_invocation_short_name
+
+#include <sys/inotify.h>
+#include <limits.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <syslog.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <string.h>
+#include <glib.h>
+
+#include <PmLogLib.h>
+#include <rdx.h>
+
+#define BUF_LEN (sizeof(struct inotify_event) + NAME_MAX + 1)
+
+/* Time to wait for core dump to complete writing to disk.
+   On m16 the longest wait is ~15 seconds. Adding extra to handle slower machines.
+*/
+#define MAX_CORE_FILE_WAIT_SECONDS 60
+#define CORE_START_WAIT_SECONDS 1
+
+int inotify_fd;
+int watch_fd;
+PmLogContext context;
+
+int
+init_notify(void)
+{
+	inotify_fd = inotify_init();
+
+	if (-1 == inotify_fd)
+	{
+		PmLogError(context, "inotify_init", 1,
+		           PMLOGKFV("error", "%s", strerror(errno)), "");
+		return 1;
+	}
+
+	watch_fd = inotify_add_watch(inotify_fd,
+	                             "@WEBOS_INSTALL_CRASHDDIR@",
+	                             IN_CLOSE_WRITE);
+
+	if (-1 == watch_fd)
+	{
+		PmLogError(context, "inotify_add_watch", 1,
+		           PMLOGKFV("error", "%s", strerror(errno)), "");
+		return 1;
+	}
+
+	return 0;
+}
+
+/**
+ * Split executable.pid into file name and pid to get the base executable name
+ * Example:
+ * input => a.out.918
+ * output => a.out, 918
+ */
+int
+get_base_cmd(char *file_name, char *base_exe, unsigned int base_len, int* pid)
+{
+	char *remember = NULL;
+
+	if (!file_name || !base_exe)
+	{
+		return 1;
+	}
+
+	while (*file_name && base_len)
+	{
+		*base_exe = *file_name;
+
+		if ('.' == *base_exe)
+		{
+			remember = base_exe;
+		}
+
+		base_exe++;
+		file_name++;
+		base_len--;
+	}
+
+	if (*file_name != '\0' || !remember)
+	{
+		return 1;
+	}
+
+	/* retrieve pid, will be 0 in case of parse error */
+	if (remember[0] != '\0' && pid != NULL)
+	{
+		*pid = atoi(remember + 1);
+	}
+
+	*remember = '\0';
+
+	return 0;
+}
+
+/**
+ * Checks if core dump is in progress and waits for it to complete.
+ */
+int
+wait_for_core_dump_to_complete(const char* component, int pid)
+{
+	char dump_file_complete[256];
+	char dump_file_inprogress[256];
+	/* Kernel truncates component name to 15 chars, do the same. */
+	char truncated_component_name[16];
+	int ms_waiting = 0;
+	int is_inprogress = 0;
+
+	if (component == NULL || pid == 0)
+	{
+	    PmLogError(context, "wait_for_core_dump_to_complete", 0, "Component or pid = null");
+		return 0;
+	}
+
+	g_snprintf(truncated_component_name, sizeof(truncated_component_name), "%s", component);
+	g_snprintf(dump_file_inprogress, sizeof(dump_file_inprogress),
+	           "@WEBOS_INSTALL_LOGDIR@/core.%s.%i.gz.inprogress", truncated_component_name, pid);
+	g_snprintf(dump_file_complete, sizeof(dump_file_complete),
+	           "@WEBOS_INSTALL_LOGDIR@/core.%s.%i.gz.complete", truncated_component_name, pid);
+
+	/* Wait until compete file appears in filesystem. */
+	while (access(dump_file_complete, F_OK ) == -1)
+	{
+		if (is_inprogress == 0 && access(dump_file_inprogress, F_OK) != -1)
+		{
+			is_inprogress = 1;
+			PmLogInfo(context, "CORE_DUMP_WAIT", 0, "Core dump in progress, waiting.");
+		}
+
+		usleep(200 * 1000);
+		ms_waiting += 200;
+
+		if ((is_inprogress == 0 && ms_waiting > CORE_START_WAIT_SECONDS * 1000) ||
+		    (ms_waiting > MAX_CORE_FILE_WAIT_SECONDS * 1000))
+		{
+			PmLogWarning(context, "CORE_DUMP_NOT_FOUND", 0, "Core dump file not found!");
+			return 0;
+		}
+	}
+
+	PmLogInfo(context, "CORE_DUMP_FOUND", 0, "Core dump file found");
+	return 1;
+}
+
+int
+submit_rdx(char *file_name)
+{
+	int ret = 0;
+	int pid = 0;
+	char base_exe[NAME_MAX];
+	char full_path[NAME_MAX];
+	RdxReportMetadata md;
+	FILE *fp = NULL;
+	char buffer[256] = {0,};
+	gchar cause[256] = {0,};    //256 since that is the max metadata length allowed by librdx
+	gchar *crash_location = NULL;
+	gchar *component = NULL;
+
+	if (!file_name)
+	{
+		PmLogError(context, "NULL_FILE_NAME", 0, "");
+		return 1;
+	}
+
+	md = create_rdx_report_metadata();
+
+	if (!md)
+	{
+		PmLogError(context, "CREATE_RDX_REPORT_METADATA", 0, "");
+		ret = 1;
+		goto exit;
+	}
+
+	if (get_base_cmd(file_name, base_exe, NAME_MAX, &pid) == 0)
+	{
+		component = g_strdup(base_exe);
+
+#if @ENABLE_CORE_DUMP@
+		wait_for_core_dump_to_complete(component, pid);
+#endif
+	}
+	else
+	{
+		component = g_strdup(file_name);
+	}
+
+	rdx_report_metadata_set_component(md, component);
+
+	fp = fopen(file_name, "r");
+
+	if (fp)
+	{
+		while (fgets(buffer, sizeof(buffer), fp) != NULL)
+		{
+			if (g_str_has_prefix(buffer, "Backtrace:"))
+			{
+				//flush buffer
+				memset(buffer, 0, sizeof(buffer));
+
+				if (fgets(buffer, sizeof(buffer), fp) != NULL)
+				{
+					if (g_str_has_prefix(buffer, "/"))
+					{
+						//replace the newline character from fgets with a '\0' because librdx does not like a newline passed in the 'cause'
+						buffer[strlen(buffer) - 1] = '\0';
+						crash_location = g_strdup(buffer);
+					}
+
+					break;
+				}
+
+				break;
+			}
+
+			memset(buffer, 0, sizeof(buffer));
+		}
+
+		fclose(fp);
+
+		if (!crash_location)
+		{
+			crash_location = g_strdup("Unknown");
+		}
+	}
+
+	g_snprintf(cause, sizeof(cause), "Linux Crash: %s crashes at location %s",
+	           component, crash_location);
+	rdx_report_metadata_set_cause(md, cause);
+	rdx_report_metadata_set_payload_filename(md, file_name);
+
+	/* construct full path for this file_name */
+	snprintf(full_path, NAME_MAX,
+	         "@WEBOS_INSTALL_CRASHDDIR@/%s",
+	         file_name);
+
+	ret = rdx_make_report_from_file(md, full_path);
+
+	if (!ret)
+	{
+		PmLogError(context, "RDX_MAKE_REPORT_FROM_FILE", 1,
+		           PMLOGKS("file", full_path), "");
+		ret = 1;
+		goto exit_destroy_rdx;
+	}
+
+exit_destroy_rdx:
+	destroy_rdx_report_metadata(md);
+exit:
+
+	if (-1 == unlink(file_name))
+	{
+		PmLogError(context, "UNLINK", 1,
+		           PMLOGKS("error", strerror(errno)), "");
+	}
+
+	g_free(crash_location);
+	g_free(component);
+	return ret;
+}
+
+int
+daemonize(const char *new_home_dir)
+{
+	int fd;
+
+	/**
+	 * When we fork a child and parent exits, upstart thinks that main
+	 * process died and restarts it. "expect fork" didn't help in the
+	 * upstart crashd script. So till this problem gets fixed comment
+	 * following code to fork a child
+	 */
+#if DO_NOT_FORK_UNTIL_UPSTART_FIXED
+
+	/**
+	 * fork a child and exit from parent. This makes sure that we start
+	 * running in the background and child is not a process group leader
+	 * which will help us to make a successful call to setsid() later
+	 */
+	switch (fork())
+	{
+		case -1: // error
+			PmLogError(context, "FORK", 1,
+			           PMLOGKS("error", strerror(errno)), "");
+			return 1;
+			break;
+
+		case 0:  // child
+			break;
+
+		default: // parent
+			_exit(EXIT_SUCCESS);
+	}
+
+	/* break association from the controlling terminal */
+	if (setsid() == -1)
+	{
+		PmLogError(context, "SETSID", 1,
+		           PMLOGKS("error", strerror(errno)), "");
+		return 1;
+	}
+
+#endif //DO_NOT_FORK_UNTIL_UPSTART_FIXED
+	umask(0);
+
+	if (chdir(new_home_dir) == -1)
+	{
+		PmLogError(context, "CHDIR", 1,
+		           PMLOGKS("error", strerror(errno)), "");
+		return 1;
+	}
+
+	for (fd = 0; fd <= STDERR_FILENO; fd++)
+	{
+		close(fd);
+	}
+
+	PmLogInfo(context, "STARTED", 0, "");
+	return 0;
+}
+
+int
+main(void)
+{
+	char buf[BUF_LEN];
+	int count;
+	char *p;
+	struct inotify_event *event;
+
+	PmLogErr err_code;
+
+	err_code = PmLogGetContext(program_invocation_short_name, &context);
+
+	if (err_code != kPmLogErr_None)
+	{
+		syslog(LOG_DAEMON | LOG_CRIT,
+		       "crashd: PmLogGetContext() returned error %d\n",
+		       err_code);
+		return EXIT_FAILURE;
+	}
+
+	if (init_notify())
+	{
+		return EXIT_FAILURE;
+	}
+
+	if (daemonize("@WEBOS_INSTALL_CRASHDDIR@"))
+	{
+		return EXIT_FAILURE;
+	}
+
+	while (1)
+	{
+		count = read(inotify_fd, buf, BUF_LEN - 1);
+		buf[BUF_LEN - 1] = '\0';
+
+		if (-1 == count)
+		{
+			PmLogError(context, "READ", 1,
+			           PMLOGKS("error", strerror(errno)), "");
+			continue;
+		}
+
+		for (p = buf; p < buf + count;)
+		{
+			event = (struct inotify_event *)p;
+			/* Report crash through pmlog */
+			PmLogInfo(context, "CRASHED", 1,
+			          PMLOGKS("process", event->name), "");
+			submit_rdx(event->name);
+			p += sizeof(struct inotify_event) + event->len;
+		}
+	}
+
+	return EXIT_SUCCESS;
+}

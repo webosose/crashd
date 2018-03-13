@@ -1,0 +1,1057 @@
+/* Catch segmentation faults and print backtrace.
+   Copyright (C) 1998, 1999, 2000, 2001, 2002, 2004, 2007
+   Free Software Foundation, Inc.
+   This file is part of the GNU C Library.
+   Contributed by Ulrich Drepper <drepper@cygnus.com>, 1998.
+
+   The GNU C Library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public
+   License as published by the Free Software Foundation; either
+   version 2.1 of the License, or (at your option) any later version.
+
+   The GNU C Library is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+   Lesser General Public License for more details.
+
+   You should have received a copy of the GNU Lesser General Public
+   License along with the GNU C Library; if not, write to the Free
+   Software Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA
+   02111-1307 USA.  */
+
+/**
+ * This file is based on debug/segfault.c from glibc-2.14.1
+ * URL: http://ftp.gnu.org/gnu/libc/glibc-2.14.1.tar.xz
+ */
+
+#define _GNU_SOURCE 1 // for using uc_mcontext
+#define HAVE_PROC_SELF 1 // for dumping self memory map
+
+#include <ctype.h>
+#include <errno.h>
+#include <execinfo.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <ucontext.h>
+#include <sys/types.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <limits.h>
+#include <libunwind.h>
+#include <sys/resource.h>
+#include <sys/prctl.h>
+
+#define _INTSIZEOF(n) ((sizeof(n) + sizeof(int) - 1) & ~(sizeof(int) - 1))
+#define _va_start(ap,v)(ap=(char *)&v+_INTSIZEOF(v))
+#define _va_arg(ap,t)(*(t*)((ap +=_INTSIZEOF(t))-_INTSIZEOF(t)))
+#define _va_end(ap) (ap = (char *)0)
+
+/* We'll use this a lot.  */
+#define WRITE_STRING(s) write(fd, s, strlen(s))
+#define WRITE_LITERAL(s) write(fd, s, sizeof(s)-1)
+#define IS_PRINTABLE(c)  ( ((c)>32 && (c)<127) )
+
+#if defined(__arm__) || defined(__aarch64__)
+#define GET_PC(ctx) ((void *) (ctx)->uc_mcontext.arm_pc)
+#elif __i386__
+#define GET_PC(ctx) ((void *) (ctx)->uc_mcontext.gregs[REG_EIP])
+#elif __x86_64__
+#define GET_PC(ctx) ((void *) (ctx)->uc_mcontext.gregs[REG_RIP])
+#else
+#error "Missing GET_PC() definition for this architecture"
+#endif
+
+#define SIG_STACK_SIZE 0x100000
+
+/* Name of the output file.  */
+static char fname[NAME_MAX];
+
+/* Name of the program.  */
+static char pname[NAME_MAX];
+
+/* Used by write_number() to get ASCII digits */
+char digits[] = "0123456789abcdef";
+
+static int
+is_little_endian()
+{
+	int x = 1;
+	return *(char *)
+	       &x;     /* only for 32 bit. if 64 bit machine, it is needed to fix. */
+}
+
+static int
+utoa(unsigned long v, unsigned int radix, char *buf, size_t length)
+{
+	char revText[sizeof(v) * CHAR_BIT + 1]; // Binary rep + NUL
+	char *rtEnd = revText + sizeof(revText);
+	char *op = rtEnd - 1;
+	unsigned int i, generatedLength;
+
+	if (buf == NULL || length == 0)
+	{
+		return -1;
+	}
+
+	*buf = '\0'; // We have a non-zero-length buffer, so ensure we always return a string
+
+	if (radix <= 1 || radix > 16)
+	{
+		return -1;
+	}
+
+	*op = '\0';
+
+	do
+	{
+		*--op = digits[v % radix];
+		v /= radix;
+	}
+	while (v);
+
+	// At this point, op points to the first character of the generated string
+	// and (rtEnd - op) is the generated string's length   including the NUL.
+	generatedLength = rtEnd - op;
+
+	if (length < generatedLength)
+	{
+		return -1;
+	}
+
+	for (i = 0; i < generatedLength; ++i)
+	{
+		buf[i] = op[i];
+	}
+
+	return generatedLength;
+}
+
+/**
+ * This function support to check if the addr is invalid or not.
+ */
+#define PAGE_SIZE 4096
+#define PAGE_START(a)   ((a) & ~(PAGE_SIZE-1))
+#define VEC_SIZE ((PAGE_SIZE * 3 - 1) / PAGE_SIZE)
+static int
+validate_mem(unw_word_t addr)
+{
+	size_t len;
+	unsigned char mvec[VEC_SIZE]; /* Unaligned access may cross page boundary */
+
+	if (PAGE_START(addr + sizeof(unw_word_t) - 1) == PAGE_START(addr))
+	{
+		len = PAGE_SIZE;
+	}
+	else
+	{
+		len = PAGE_SIZE * 2;
+	}
+
+	if (addr == 0)
+	{
+		return -1;
+	}
+
+	addr = PAGE_START(addr);
+
+	if (mincore((void *) addr, len, mvec) == -1)
+	{
+		return -1;
+	}
+
+	return 0;
+}
+
+static ssize_t
+write_number(int fd, unsigned long number, unsigned int base)
+{
+	char buf[sizeof(unsigned long) * CHAR_BIT + 2];
+	int len = utoa(number, base, buf, sizeof(buf));
+	ssize_t ret = 0;
+
+	if (len > 0)
+	{
+		if (16 == base)
+		{
+			ret += write(fd, "0x", 2);
+		}
+
+		ret += write(fd, buf, len - 1);
+	}
+
+	return ret;
+}
+
+static ssize_t
+write_padded_number(int fd, unsigned long number, unsigned int base,
+                    unsigned int maxPaddingSize)
+{
+	int i = 0;
+	char buf[sizeof(unsigned long) * CHAR_BIT + 2];
+	int len = utoa(number, base, buf, sizeof(buf));
+
+	ssize_t ret = 0;
+
+	if (len > 0)
+	{
+		if (16 == base)
+		{
+			ret += write(fd, "0x", 2);
+		}
+
+		for (i = len - 1; i < maxPaddingSize; i++)
+		{
+			ret += write(fd, "0", 1);
+		}
+
+		ret += write(fd, buf, len - 1);
+	}
+
+	return ret;
+}
+
+static void
+write_strsignal(int fd, int signal)
+{
+	if (signal < 0 || signal >= _NSIG || _sys_siglist[signal] == NULL)
+	{
+		WRITE_LITERAL("unknown signal: ");
+		write_number(fd, signal, 10);
+	}
+	else
+	{
+		WRITE_STRING(_sys_siglist[signal]);
+	}
+}
+
+static void
+write_unw_info(int fd, void *addr)
+{
+	char **symbol = backtrace_symbols(&addr, 1);
+
+	if (!symbol)
+	{
+		WRITE_LITERAL("[");
+		write_number(fd, (uintptr_t)addr, 16);
+		WRITE_LITERAL("]\n");
+		return;
+	}
+
+	WRITE_STRING(symbol[0]);
+	WRITE_LITERAL("\n");
+
+	free(symbol);
+}
+
+/**
+ * The max size of '/proc/x/comm' is fixed as 16byte(TASK_COMM_LEN) in kernel.
+ *
+ * The comm patch will be '/proc/self/task/<tid>/comm' and generally the max pid
+ * is 32768. Therefore the 64 byte as the size of thread comm path is engouth.
+ */
+#define TASK_COMM_LEN 16
+#define THREAD_COMM_PATH_LEN 64
+static void
+write_thread_info(int fd)
+{
+	int tfd;
+	pid_t tid;
+#ifdef HAVE_PROC_SELF
+	char tpath[THREAD_COMM_PATH_LEN];
+#endif
+
+	tid = syscall(SYS_gettid);
+
+	WRITE_LITERAL("\nThread Info: ");
+	WRITE_LITERAL("\nTid: ");
+
+	if (tid >= 0)
+	{
+		write_number(fd, tid, 10);
+	}
+
+#ifdef HAVE_PROC_SELF
+	snprintf(tpath, THREAD_COMM_PATH_LEN, "/proc/self/task/%d/comm", tid);
+
+	tfd = open(tpath, O_RDONLY, 0);
+
+	if (tfd >= 0)
+	{
+		char tname[TASK_COMM_LEN];;
+		ssize_t n;
+
+		WRITE_LITERAL("\nComm: ");
+
+		while ((n = TEMP_FAILURE_RETRY(read(tfd, tname, sizeof(tname)))) > 0)
+		{
+			TEMP_FAILURE_RETRY(write(fd, tname, n - 1)); /* -1 is to skip a blank line */
+		}
+
+		close(tfd);
+	}
+
+#endif
+}
+
+static void
+dump_hex(int fd, void *vcp, int size)
+{
+	/*  print format
+	0x5ba9ccd0(0000): 17140100 7b000000 94dee04e 17140100 ....{......N....
+	0x5ba9cce0(0010): 01000000 a0c2bf02 94dee04e a04c5370 ...........N.LSp
+	0x5ba9ccf0(0020): 52010000 f0a3d64e 20cfa95b 14d6a95b R......N ..[...[
+	*/
+
+	unsigned int i, j, hpos, cpos;
+	int length;
+	int id[4];
+#define GHD_BUFSZ 80
+
+	char buf[GHD_BUFSZ + 1] = {0};
+	unsigned char *cp, uc;
+
+	cp = (unsigned char *)vcp;
+
+	for (j = 0; j < sizeof(buf); j++)
+	{
+		buf[j] = ' ';
+	}
+
+	hpos = cpos = 0;
+
+	/* make multiple of four */
+	if (size % 4 != 0)
+	{
+		size = size + (4 - (size % 4));
+	}
+
+	if (is_little_endian())
+	{
+		id[0] = 3;
+		id[1] = 2;
+		id[2] = 1;
+		id[3] = 0;
+	}
+	else
+	{
+		id[0] = 0;
+		id[1] = 1;
+		id[2] = 2;
+		id[3] = 3;
+	}
+
+	for (i = 0; i < size;)
+	{
+		if ((i % 16) == 0)
+		{
+			for (j = 0; j < sizeof(buf); j++)
+			{
+				buf[j] = ' ';
+			}
+
+			/* offset */
+			buf[0] = '\n';
+			buf[1] = '0';
+			buf[2] = 'x';
+			hpos = 3;
+
+			/* if addressBuf,offsetBuf size is changed, you should consider buf[]'s size too */
+			char addressBuf[8 + 1];
+			char offsetBuf[4 + 1];
+
+			/* address */
+			length = utoa((unsigned int)vcp + i, 16, addressBuf, sizeof(addressBuf));
+
+			int paddingSize = sizeof(addressBuf) - length;
+
+			if (length < 0)     // in case of error, write '00000000'
+			{
+				paddingSize = sizeof(addressBuf) - 1;
+				length = 1;
+			}
+
+			for (j = 0; j < paddingSize; j++)
+			{
+				buf[hpos++] = '0';
+			}
+
+			for (j = 0; j < length - 1; j++)
+			{
+				buf[hpos++] = addressBuf[j];
+			}
+
+			/* offset */
+			length = utoa(i, 16, offsetBuf, sizeof(offsetBuf));
+			paddingSize = sizeof(offsetBuf) - length;
+
+			buf[hpos++] = '(';
+
+			if (length < 0)     // in case of error, write '0000'
+			{
+				paddingSize = sizeof(offsetBuf) - 1;
+				length = 1;
+			}
+
+			for (j = 0; j < paddingSize; j++)
+			{
+				buf[hpos++] = '0';
+			}
+
+			for (j = 0; j < length - 1; j++)
+			{
+				buf[hpos++] = offsetBuf[j];
+			}
+
+			buf[hpos++] = ')';
+			buf[hpos++] = ':';
+		}
+
+		if ((i % 4) == 0)
+		{
+			buf[hpos++] = ' ';
+		}
+
+		/* hex value */
+		if ((i + 0) < size)
+		{
+			uc = cp[i + id[0]];
+			buf[hpos++] = digits[(uc & 0xF0) >> 4];
+			buf[hpos++] = digits[uc & 0x0F];
+		}
+
+		if ((i + 1) < size)
+		{
+			uc = cp[i + id[1]];
+			buf[hpos++] = digits[(uc & 0xF0) >> 4];
+			buf[hpos++] = digits[uc & 0x0F];
+		}
+
+		if ((i + 2) < size)
+		{
+			uc = cp[i + id[2]];
+			buf[hpos++] = digits[(uc & 0xF0) >> 4];
+			buf[hpos++] = digits[uc & 0x0F];
+		}
+
+		if ((i + 3) < size)
+		{
+			uc = cp[i + id[3]];
+			buf[hpos++] = digits[(uc & 0xF0) >> 4];
+			buf[hpos++] = digits[uc & 0x0F];
+		}
+
+		/* ascii code */
+		cpos = (i % 16) + 56;
+
+		if ((i + 0) < size)
+		{
+			buf[cpos++] = (IS_PRINTABLE(cp[i + id[0]]) ? cp[i + id[0]] : '.');
+		}
+
+		if ((i + 1) < size)
+		{
+			buf[cpos++] = (IS_PRINTABLE(cp[i + id[1]]) ? cp[i + id[1]] : '.');
+		}
+
+		if ((i + 2) < size)
+		{
+			buf[cpos++] = (IS_PRINTABLE(cp[i + id[2]]) ? cp[i + id[2]] : '.');
+		}
+
+		if ((i + 3) < size)
+		{
+			buf[cpos++] = (IS_PRINTABLE(cp[i + id[3]]) ? cp[i + id[3]] : '.');
+		}
+
+		i += 4;
+
+		if ((i % 16) == 0)
+		{
+			buf[cpos] = 0x00;
+			WRITE_STRING(buf);
+		}
+	}
+
+	buf[cpos] = 0x00;
+
+	if ((i % 16) != 0)
+	{
+		WRITE_STRING(buf);
+	}
+
+	WRITE_LITERAL("\n");
+}
+
+static void
+dump_stack(int fd, const ucontext_t *ctx, int size)
+{
+#if defined(__arm__) || defined(__aarch64__)
+	WRITE_LITERAL("\nStack dump:");
+
+#if defined(__aarch64__)
+	if (validate_mem((unw_word_t)ctx->uc_mcontext.sp))
+#else
+	if (validate_mem((unw_word_t)ctx->uc_mcontext.arm_sp))
+#endif
+	{
+		WRITE_LITERAL("\nskipped (invalid sp)\n");
+		return ;
+	}
+
+#if defined(__aarch64__)
+	dump_hex(fd, (void *)ctx->uc_mcontext.sp, size);
+#else
+	dump_hex(fd, (void *)ctx->uc_mcontext.arm_sp, size);
+#endif
+#else
+	WRITE_LITERAL("\nStack dump is not supported for this architecture\n");
+#endif
+}
+
+static void
+dump_register(int fd, const ucontext_t *ctx)
+{
+#if defined(__arm__) || defined(__aarch64__)
+	const unsigned int paddingSize = 8;
+	WRITE_LITERAL("\nRegister dump:");
+
+#if defined(__aarch64__)
+	for (int i = 0; i < 31; ++i) {
+		if (i % 4 == 0)
+			WRITE_LITERAL("\nr");
+		else
+			WRITE_LITERAL("  r");
+		write_padded_number(fd, i, 10, 3);
+		WRITE_LITERAL(": ");
+		write_padded_number(fd, (uintptr_t)ctx->uc_mcontext.regs[i], 16, paddingSize);
+	}
+
+	WRITE_LITERAL("  sp: ");
+	write_padded_number(fd, (uintptr_t)ctx->uc_mcontext.sp, 16, paddingSize);
+
+	WRITE_LITERAL("  pc: ");
+	write_padded_number(fd, (uintptr_t)ctx->uc_mcontext.pc, 16, paddingSize);
+
+	WRITE_LITERAL("  pstate ");
+	write_padded_number(fd, (uintptr_t)ctx->uc_mcontext.pstate, 16, paddingSize);
+
+	WRITE_LITERAL("  addr: ");
+	write_padded_number(fd, (uintptr_t)ctx->uc_mcontext.fault_address, 16,
+	                    paddingSize);
+#else
+	WRITE_LITERAL("\nr0: ");
+	write_padded_number(fd, (uintptr_t)ctx->uc_mcontext.arm_r0, 16, paddingSize);
+
+	WRITE_LITERAL("  r1: ");
+	write_padded_number(fd, (uintptr_t)ctx->uc_mcontext.arm_r1, 16, paddingSize);
+
+	WRITE_LITERAL("  r2: ");
+	write_padded_number(fd, (uintptr_t)ctx->uc_mcontext.arm_r2, 16, paddingSize);
+
+	WRITE_LITERAL("  r3: ");
+	write_padded_number(fd, (uintptr_t)ctx->uc_mcontext.arm_r3, 16, paddingSize);
+
+	WRITE_LITERAL("\nr4: ");
+	write_padded_number(fd, (uintptr_t)ctx->uc_mcontext.arm_r4, 16, paddingSize);
+
+	WRITE_LITERAL("  r5: ");
+	write_padded_number(fd, (uintptr_t)ctx->uc_mcontext.arm_r5, 16, paddingSize);
+
+	WRITE_LITERAL("  r6: ");
+	write_padded_number(fd, (uintptr_t)ctx->uc_mcontext.arm_r6, 16, paddingSize);
+
+	WRITE_LITERAL("  r7: ");
+	write_padded_number(fd, (uintptr_t)ctx->uc_mcontext.arm_r7, 16, paddingSize);
+
+	WRITE_LITERAL("\nr8: ");
+	write_padded_number(fd, (uintptr_t)ctx->uc_mcontext.arm_r8, 16, paddingSize);
+
+	WRITE_LITERAL("  r9: ");
+	write_padded_number(fd, (uintptr_t)ctx->uc_mcontext.arm_r9, 16, paddingSize);
+
+	WRITE_LITERAL("  r10: ");
+	write_padded_number(fd, (uintptr_t)ctx->uc_mcontext.arm_r10, 16, paddingSize);
+
+	WRITE_LITERAL("  fp: ");
+	write_padded_number(fd, (uintptr_t)ctx->uc_mcontext.arm_fp, 16, paddingSize);
+
+	WRITE_LITERAL("\nip: ");
+	write_padded_number(fd, (uintptr_t)ctx->uc_mcontext.arm_ip, 16, paddingSize);
+
+	WRITE_LITERAL("  sp: ");
+	write_padded_number(fd, (uintptr_t)ctx->uc_mcontext.arm_sp, 16, paddingSize);
+
+	WRITE_LITERAL("  lr: ");
+	write_padded_number(fd, (uintptr_t)ctx->uc_mcontext.arm_lr, 16, paddingSize);
+
+	WRITE_LITERAL("  pc: ");
+	write_padded_number(fd, (uintptr_t)ctx->uc_mcontext.arm_pc, 16, paddingSize);
+
+	WRITE_LITERAL("\ncpsr: ");
+	write_padded_number(fd, (uintptr_t)ctx->uc_mcontext.arm_cpsr, 16, paddingSize);
+
+	WRITE_LITERAL("  trap: ");
+	write_padded_number(fd, (uintptr_t)ctx->uc_mcontext.trap_no, 16, paddingSize);
+
+	WRITE_LITERAL("  error: ");
+	write_padded_number(fd, (uintptr_t)ctx->uc_mcontext.error_code, 16,
+	                    paddingSize);
+
+	WRITE_LITERAL("\noldMask: ");
+	write_padded_number(fd, (uintptr_t)ctx->uc_mcontext.oldmask, 16, paddingSize);
+
+	WRITE_LITERAL("  addr: ");
+	write_padded_number(fd, (uintptr_t)ctx->uc_mcontext.fault_address, 16,
+	                    paddingSize);
+#endif
+
+	WRITE_LITERAL("\n");
+
+#else
+	WRITE_LITERAL("\nRegister dump is not supported for this architecture\n");
+#endif
+
+	return;
+}
+
+static int
+custom_fprintf(void *stream, const char *format, ...)
+{
+#define MAX_BUF_SIZE    512
+	char str[MAX_BUF_SIZE] = {0,};
+	char *buf = str;
+	char *arg;
+	char *p;
+	int len = 0;
+	int fd;
+
+	if (stream == NULL || format == NULL)
+	{
+		return 0;
+	}
+
+	fd = *(int *)stream;
+	_va_start(arg, format);
+
+	while (*format)
+	{
+		if (*format != '%') /* normal case */
+		{
+			*buf++ = *format++;
+			continue;
+		}
+
+		format++;   /* skip '%' */
+
+		if (*format == '%') /* '%' appeared continually */
+		{
+			*buf++ = *format++;
+			continue;
+		}
+
+		*buf = '\0';
+		len += WRITE_STRING(str);
+		buf = str;
+
+		switch (*format)
+		{
+			case 'c' :
+				*buf++ = (char)_va_arg(arg, char);
+				break;
+
+			case 'd' :
+				len += write_number(fd, (int)_va_arg(arg, int), 10);
+				break;
+
+			case 'x' : //FALL-THROUGH
+			case 'p' : //FALL-THROUGH
+			case 'X' :
+				len += write_number(fd, (unsigned int)_va_arg(arg, unsigned int), 16);
+				break;
+
+			case 's' :
+				p = _va_arg(arg, char *);
+				len += WRITE_STRING(p);
+				break;
+
+			default :
+				*buf++ = *format; /* invalid formatting */
+				break;
+		}
+
+		format++;
+	}
+
+	_va_end(arg);
+
+	*buf = '\0';
+	len += WRITE_STRING(str);
+
+	return len;
+}
+
+/* Enables core dump generation */
+static void enable_core_dump(void)
+{
+	struct rlimit rlim;
+	getrlimit(RLIMIT_CORE,&rlim);
+	rlim.rlim_cur = rlim.rlim_max;
+	setrlimit(RLIMIT_CORE,&rlim);
+
+	prctl(PR_SET_DUMPABLE, 1, 0, 0);
+}
+
+/**
+ * This function is called when a segmentation fault is caught.  The system
+ * is in an unstable state now.  This means especially that malloc() might
+ * not work anymore.
+ */
+static void
+catch_segfault(int sig, siginfo_t *si, void *ucontext)
+{
+	int fd, cnt, mypid;
+	void *addr;
+	struct sigaction sa;
+	unw_cursor_t cursor;
+	unw_context_t uc;
+	unw_word_t ip, sp;
+	ucontext_t *ctx = (ucontext_t *)ucontext;
+#ifdef HAVE_PROC_SELF
+	int mapfd;
+	char buf[256];
+#endif
+
+#if defined(__arm__) || defined(__aarch64__)
+	/**
+	 * This is workaroud to block other signal race condition.
+	 * Basically signals added by sigaddset() should be blocked in handler.
+	 * However, sigaddset does not work for our mobile device. The device is
+	 * using android kernel. If the root cause why sigaddset does not work at
+	 * mobile device is sovled, this workaround can be removed.
+	 **/
+	signal(SIGTERM, SIG_IGN);
+	signal(SIGSEGV, SIG_IGN);
+	signal(SIGILL, SIG_IGN);
+	signal(SIGABRT, SIG_IGN);
+	signal(SIGFPE, SIG_IGN);
+	signal(SIGBUS, SIG_IGN);
+	signal(SIGSTKFLT, SIG_IGN);
+#endif
+
+	/**
+	 * This is the name of the file we are writing to.  If none is given
+	 * or we cannot write to this file write to stderr.
+	 **/
+	fd = STDERR_FILENO;
+
+	if ('\0' == fname[0] && '\0' != pname[0])
+	{
+		/* create a unique fname: argv[0].pid */
+		snprintf(fname, NAME_MAX,
+		         "@WEBOS_INSTALL_CRASHDDIR@/%s.%d",
+		         pname, getpid());
+	}
+
+	if (fname[0] != '\0')
+	{
+		fd = open(fname, O_TRUNC | O_WRONLY | O_CREAT, 0666);
+
+		if (fd == -1)
+		{
+			custom_fprintf(stderr, "\n%s\n\n", fname);
+			perror("open");
+			fd = 2;
+		}
+	}
+
+	WRITE_LITERAL("*** ");
+	write_strsignal(fd, sig);
+
+	WRITE_LITERAL("\nComm: ");
+	WRITE_STRING(program_invocation_short_name);
+
+	WRITE_LITERAL("\nCmdline: ");
+	WRITE_STRING(program_invocation_name);
+
+	WRITE_LITERAL("\nPid: ");
+	mypid = getpid();
+	write_number(fd, mypid, 10);
+
+	WRITE_LITERAL("\nSignal: ");
+	write_number(fd, sig, 10);
+
+	WRITE_LITERAL("\nSignalCode: ");
+	write_number(fd, si->si_code, 10);
+
+	if (SIGILL == sig || SIGFPE == sig || SIGSEGV == sig
+	        || SIGBUS == sig)
+	{
+		WRITE_LITERAL("\nFaultAddress: ");
+		write_number(fd, (uintptr_t)si->si_addr, 16);
+	}
+
+	WRITE_LITERAL("\n");
+
+	dump_register(fd, ucontext);
+	dump_stack(fd, ucontext, 0x100);
+#ifdef HAVE_PROC_SELF
+	/* Now the link map.  */
+	mapfd = open("/proc/self/maps", O_RDONLY);
+
+	if (mapfd != -1)
+	{
+		WRITE_LITERAL("\nMemory map:\n");
+
+		ssize_t n;
+
+		while ((n = TEMP_FAILURE_RETRY(read(mapfd, buf, sizeof(buf)))) > 0)
+		{
+			TEMP_FAILURE_RETRY(write(fd, buf, n));
+		}
+
+		close(mapfd);
+	}
+
+	/* try the proc status file */
+	snprintf(buf, 64, "/proc/%d/status", mypid);
+	mapfd = open(buf, O_RDONLY);
+
+	if (mapfd != -1)
+	{
+		WRITE_LITERAL("\n/proc/{pid}/status:\n");
+
+		ssize_t n;
+
+		while ((n = TEMP_FAILURE_RETRY(read(mapfd, buf, sizeof(buf)))) > 0)
+		{
+			TEMP_FAILURE_RETRY(write(fd, buf, n));
+		}
+
+		close(mapfd);
+	}
+
+	mapfd = open("/proc/meminfo", O_RDONLY);
+
+	if (mapfd != -1)
+	{
+		WRITE_LITERAL("\nMeminfo:\n");
+
+		ssize_t n;
+
+		while ((n = TEMP_FAILURE_RETRY(read(mapfd, buf, sizeof(buf)))) > 0)
+		{
+			TEMP_FAILURE_RETRY(write(fd, buf, n));
+		}
+
+		close(mapfd);
+	}
+
+#endif
+
+#if defined(__arm__) || defined(__aarch64__)
+	/* print additional infomation only for arm */
+	WRITE_LITERAL("\n\nPC: ");
+#if defined(__aarch64__)
+	write_unw_info(fd, (void *)ctx->uc_mcontext.pc);
+#else
+	write_unw_info(fd, (void *)ctx->uc_mcontext.arm_pc);
+	WRITE_LITERAL("LR: ");
+	write_unw_info(fd, (void *)ctx->uc_mcontext.arm_lr);
+#endif
+#endif
+
+	WRITE_LITERAL("\nBacktrace:\n");
+
+	unw_getcontext(&uc);
+	unw_init_local(&cursor, &uc);
+	unw_step(&cursor);
+	cnt = 0;
+
+	while (unw_step(&cursor) > 0)
+	{
+		unw_get_reg(&cursor, UNW_REG_IP, &ip);
+		unw_get_reg(&cursor, UNW_REG_SP, &sp);
+
+		if (validate_mem(ip))
+		{
+#if defined(__arm__)
+			/* print additional infomation only for arm */
+			WRITE_LITERAL("[");
+			write_number(fd, (uintptr_t)ip, 16);
+			WRITE_LITERAL("]\n");
+			addr = (void *)ctx->uc_mcontext.arm_lr;
+#else
+			addr = (void *)ip;
+#endif
+		}
+		else
+		{
+			addr = (void *)ip;
+		}
+
+		write_unw_info(fd, addr);
+
+		/* Get the backtrace. We restrict callback to 64 frames */
+		cnt++;
+
+		if (cnt >= 64)
+		{
+			break;
+		}
+	}
+
+	if (cnt < 1)
+	{
+		WRITE_LITERAL("Couldn't retrieve backtrace!\n"
+		              "Recompile program with CFLAGS += -funwind-tables "
+		              "and LD_FLAGS += -rdynamic\n");
+	}
+
+	write_thread_info(fd);
+
+	WRITE_LITERAL("\n\n*** End of info\n");
+
+	/* Close the report file before raising the signal */
+	if (STDERR_FILENO != fd)
+	{
+		close(fd);
+	}
+
+#if @ENABLE_CORE_DUMP@
+	enable_core_dump();
+#endif
+
+	/* Pass on the signal (so that a core file is produced) */
+	sa.sa_handler = SIG_DFL;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = 0;
+	sigaction(sig, &sa, NULL);
+	raise(sig);
+}
+
+static void
+__attribute__((constructor))
+install_handler(void)
+{
+	struct sigaction sa;
+	const char *sigs = getenv("SEGFAULT_SIGNALS");
+	const char *name;
+
+	sa.sa_handler = (void *) catch_segfault;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = SA_RESTART | SA_SIGINFO;
+
+	/* Maybe we are not expected to use an alternative stack.  */
+	if (NULL == getenv("SEGFAULT_NO_ALTSTACK"))
+	{
+		/* 1MB: To use libunwind need more stack. */
+		void *stack_mem = malloc(SIG_STACK_SIZE);
+		stack_t ss;
+
+		if (stack_mem != NULL)
+		{
+			ss.ss_sp = stack_mem;
+			ss.ss_flags = 0;
+			ss.ss_size = SIG_STACK_SIZE;
+
+			if (sigaltstack(&ss, NULL) == 0)
+			{
+				sa.sa_flags |= SA_ONSTACK;
+			}
+		}
+	}
+
+	if (sigs == NULL)
+	{
+		sigaddset(&sa.sa_mask, SIGTERM);
+		sigaddset(&sa.sa_mask, SIGSEGV);
+		sigaddset(&sa.sa_mask, SIGILL);
+		sigaddset(&sa.sa_mask, SIGABRT);
+		sigaddset(&sa.sa_mask, SIGFPE);
+		sigaddset(&sa.sa_mask, SIGBUS);
+		sigaddset(&sa.sa_mask, SIGSTKFLT);
+
+		sigaction(SIGSEGV, &sa, NULL);
+		sigaction(SIGILL, &sa, NULL);
+		sigaction(SIGABRT, &sa, NULL);
+		sigaction(SIGFPE, &sa, NULL);
+		sigaction(SIGBUS, &sa, NULL);
+		sigaction(SIGSTKFLT, &sa, NULL);
+	}
+	else if (sigs[0] == '\0')
+	{
+		/* Do not do anything.  */
+		return;
+	}
+	else
+	{
+		const char *where;
+		int all = strcasecmp(sigs, "all") == 0;
+
+		sigaddset(&sa.sa_mask, SIGTERM);
+
+#define SET_FOR_SIG(sig, name)      \
+      where = strcasestr(sigs, name);         \
+      if (all || (where != NULL           \
+        && (where == sigs || !isalnum(where[-1])) \
+        && !isalnum(where[sizeof (name) - 1])))   \
+        sigaddset(&sa.sa_mask, sig);
+
+#define INSTALL_FOR_SIG(sig, name)      \
+      if (all || sigismember(&sa.sa_mask, sig))         \
+        sigaction(sig, &sa, NULL);
+
+		SET_FOR_SIG(SIGSEGV, "segv");
+		SET_FOR_SIG(SIGILL, "ill");
+#ifdef SIGBUS
+		SET_FOR_SIG(SIGBUS, "bus");
+#endif
+#ifdef SIGSTKFLT
+		SET_FOR_SIG(SIGSTKFLT, "stkflt");
+#endif
+		SET_FOR_SIG(SIGABRT, "abrt");
+		SET_FOR_SIG(SIGFPE, "fpe");
+
+		INSTALL_FOR_SIG(SIGSEGV, "segv");
+		INSTALL_FOR_SIG(SIGILL, "ill");
+#ifdef SIGBUS
+		INSTALL_FOR_SIG(SIGBUS, "bus");
+#endif
+#ifdef SIGSTKFLT
+		INSTALL_FOR_SIG(SIGSTKFLT, "stkflt");
+#endif
+		INSTALL_FOR_SIG(SIGABRT, "abrt");
+		INSTALL_FOR_SIG(SIGFPE, "fpe");
+	}
+
+	/* Preserve the output file name if there is any given.  */
+	name = getenv("SEGFAULT_OUTPUT_NAME");
+
+	if (name != NULL && name[0] != '\0')
+	{
+		int ret = access(name, R_OK | W_OK);
+
+		if (ret == 0 || (ret == -1 && errno == ENOENT))
+		{
+			strncpy(fname, name, sizeof(fname));
+
+			if (sizeof(fname) > 0)
+			{
+				fname[sizeof(fname) - 1] = '\0';
+			}
+		}
+	}
+	else
+	{
+		// Some applications after forking can mangle its name
+		// so save program short name in variable
+		// pname is static so initialized with zeroes
+		// copy program name into pname but leave last character with '0' value
+		strncpy(pname, program_invocation_short_name, (sizeof(pname) - 1));
+	}
+}
